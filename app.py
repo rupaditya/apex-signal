@@ -15,7 +15,11 @@ try:
             os.environ[_k] = _v
 except Exception:
     pass
-
+import sys, types  # flat repo layout: treat the repo root as the apex_signal package
+if not os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "apex_signal")):
+    _pkg = types.ModuleType("apex_signal")
+    _pkg.__path__ = [os.path.dirname(os.path.abspath(__file__))]
+    sys.modules.setdefault("apex_signal", _pkg)
 from apex_signal.config import load_settings
 from apex_signal.db import RunStore
 from apex_signal.llm import build_llm
