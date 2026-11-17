@@ -504,6 +504,7 @@ def select_angle(items: list[EvidenceItem], identity: IdentityDecision, conflict
 BANNED_PHRASES = ["hope this finds you well", "i hope you're doing well", "synergy", "game-changer",
                   "revolutionize", "touch base", "circle back", "guaranteed", "100%"]
 MAX_BODY_WORDS = 150
+VERBATIM_WORDS = 9
 
 
 def deterministic_draft_checks(draft, allowed_ids: set[str], evidence_text: str, conflicts: dict) -> list[str]:
@@ -535,4 +536,11 @@ def deterministic_draft_checks(draft, allowed_ids: set[str], evidence_text: str,
                 problems.append(f"Mentions a conflicted fact value ({key}: {v['value']}).")
     if "http" in low:
         problems.append("Contains a URL.")
+    # quoting a source word-for-word reads as plagiarism (and can put someone else's "we/us" in our mouth)
+    bw = norm(draft.body).split()
+    for i in range(len(bw) - VERBATIM_WORDS + 1):
+        span = " ".join(bw[i:i + VERBATIM_WORDS])
+        if span in ev:
+            problems.append(f"Copies source text verbatim (\"{span}…\"); paraphrase it in our own words.")
+            break
     return problems
