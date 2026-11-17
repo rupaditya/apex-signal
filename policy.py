@@ -171,6 +171,14 @@ def roles_compatible(given: str, found: str) -> bool:
     return norm(given) in norm(found) or norm(found) in norm(given)
 
 
+def same_role(given: str, found: str) -> bool:
+    """Strict: the same job family (CFO vs CFO), not merely both finance roles."""
+    g, f = role_families(given), role_families(found)
+    if g and f:
+        return bool(g & f)
+    return norm(given) == norm(found)
+
+
 def in_buyer_persona(role: str) -> bool:
     return bool(role_families(role) & FINANCE_FAMILIES)
 
@@ -246,10 +254,14 @@ def decide_identity(extraction, sources: dict, company_name: str, prospect_name:
     former_at_target = [m for m in grounded if not m.is_current and employer_matches(m.employer, company_name, company_domain)]
     other_employers = {company_core(m.employer) for m in elsewhere_current}
 
-    if at_target_current and (former_at_target or elsewhere_current) and former_at_target:
+    # An earlier, different role at the same company is career history (e.g. promoted to CFO), not a conflict.
+    # It is a conflict only when a source calls the SAME role (the one we'd pitch to) former.
+    former_same_role = [m for m in former_at_target if same_role(role, m.title)]
+    current_same_role = [m for m in at_target_current if roles_compatible(role, m.title)]
+    if current_same_role and former_same_role:
         prospect_status = "CONFLICTING"
-        reasons.append(f"Sources disagree on whether {prospect_name} still works at {company_name} "
-                       f"(listed as current in {len(at_target_current)} source(s), former in {len(former_at_target)}).")
+        reasons.append(f"Sources disagree on whether {prospect_name} is still {role} at {company_name} "
+                       f"(current in {len(current_same_role)} source(s), former in {len(former_same_role)}).")
     elif at_target_current:
         if any(roles_compatible(role, m.title) for m in at_target_current):
             prospect_status = "CONFIRMED"
@@ -259,6 +271,9 @@ def decide_identity(extraction, sources: dict, company_name: str, prospect_name:
             prospect_status = "ROLE_MISMATCH"
             reasons.append(f"{prospect_name} found at {company_name} but titled "
                            f"'{at_target_current[0].title}', not '{role}'. Email will not assert the role.")
+        if former_at_target:
+            reasons.append(f"Earlier roles at {company_name} treated as career history: "
+                           f"{', '.join(sorted({m.title for m in former_at_target}))}.")
         if elsewhere_current:
             reasons.append(f"Note: same name also appears at {', '.join(sorted(other_employers))} (treated as a different person).")
     elif former_at_target:
