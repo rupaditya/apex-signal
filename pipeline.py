@@ -235,7 +235,7 @@ class Pipeline:
                         "Classify carefully: erp_or_finance_system_change ONLY when the company is changing its OWN "
                         "internal accounting/ERP systems – a product or service the company SELLS (e.g. its platform "
                         "integrating with customers' ERPs) is product_or_marketing. ap_finance_hiring ONLY for jobs "
-                        "inside the company's own finance/AP team. IPO filings/listing plans are ipo_or_listing.",
+                        "inside the company's own finance/AP team. IPO filings/listing plans are ipo_or_listing. Plans stated inside a funding announcement (e.g. 'will use the funds to expand') are part of funding, not a separate expansion signal.",
                         f"Target company: {company} ({identity.company_domain or 'domain unknown'})\n"
                         f"Prospect: {person} ({role})\n\nSOURCES:\n{self._sources_block(batch)}\n\n"
                         "Extract (a) observations useful for understanding this company's finance/AP situation or "
