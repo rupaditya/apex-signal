@@ -317,7 +317,10 @@ class Pipeline:
               f"Open with the PRIMARY evidence {angle.primary.id} (supporting evidence may only add detail after it); "
               "subject must also be about the primary signal. No flattery, no 'I hope this finds you well'. Then one question linking "
               "it to AP workload. Do NOT assume their current process is manual, slow or broken – ask, don't assert. "
-              "One sentence on what Apex does, then a low-friction ask. Sign off as '[Your name]'. "
+              "Refer to the evidence in your own words and in the third person ('I saw Beca's announcement that…'); "
+              "never copy a quote verbatim and never use the source's 'we/us/our'. "
+              "One sentence on what Apex does, using ONLY the seller description (no integrations, customers or results "
+              "it does not state), then a low-friction ask. Sign off as '[Your name]'. "
               "In `claims`, list every sentence with its kind and the evidence ids it relies on.")
         try:
             draft = self.llm.call_json("draft", "You write short, specific, honest B2B emails that sound human.",
