@@ -86,7 +86,7 @@ class OpenAICompatLLM(BaseLLM):
         self.model = model
         self.notes: list[str] = []
         # SDK retries 429/5xx with exponential backoff – important on free-tier rate limits
-        self.client = OpenAI(api_key=api_key, base_url=self.BASE_URLS.get(provider), timeout=timeout, max_retries=4)
+        self.client = OpenAI(api_key=api_key, base_url=self.BASE_URLS.get(provider), timeout=timeout, max_retries=2)
 
     # preference order used when the configured model id no longer exists (providers retire ids often)
     PREFERENCES = {
@@ -162,9 +162,16 @@ class FallbackLLM(BaseLLM):
         self.model = providers[0].model
         self.events: list[str] = []
 
+    COOLDOWN_S = 600  # a rate-limited free tier is skipped for 10 min instead of being retried on every call
+
     def call_json(self, task, system, user, model_cls):
+        import time
         errors = []
-        for p in self.providers:
+        now = time.time()
+        if not hasattr(self, "_cooldown"):
+            self._cooldown = {}
+        active = [p for p in self.providers if self._cooldown.get(p.name, 0) <= now] or self.providers
+        for p in active:
             try:
                 out = p.call_json(task, system, user, model_cls)
                 for n in getattr(p, "notes", []):
@@ -175,6 +182,11 @@ class FallbackLLM(BaseLLM):
                 return out
             except LLMError as e:
                 errors.append(str(e))
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "rate limit" in str(e).lower():
+                    self._cooldown[p.name] = time.time() + self.COOLDOWN_S
+                    note = f"{p.name} rate-limited (429): skipped for {self.COOLDOWN_S // 60} min"
+                    if note not in self.events:
+                        self.events.append(note)
         raise LLMError(" | ".join(errors))
 
 
