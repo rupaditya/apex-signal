@@ -27,7 +27,22 @@ CREATE TABLE IF NOT EXISTS runs (
     edited_body TEXT,
     reviewer_note TEXT,
     error TEXT,
-    providers TEXT
+    providers TEXT,
+    batch_id TEXT,
+    parent_run_id TEXT
+);
+CREATE TABLE IF NOT EXISTS cache (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (kind, key)
+);
+CREATE TABLE IF NOT EXISTS batches (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    name TEXT,
+    run_ids TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS stages (
     run_id TEXT NOT NULL,
@@ -52,6 +67,10 @@ class RunStore:
         self.path = path
         with self._conn() as c:
             c.executescript(SCHEMA)
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(runs)").fetchall()}
+            for col in ("batch_id", "parent_run_id"):  # migrate databases created by older versions
+                if col not in cols:
+                    c.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
 
     @contextmanager
     def _conn(self):
@@ -94,6 +113,41 @@ class RunStore:
         with self._conn() as c:
             rows = c.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- cache ------------------------------------------------------------
+    def cache_get(self, kind: str, key: str, max_age_hours: float):
+        with self._conn() as c:
+            row = c.execute("SELECT created_at, value_json FROM cache WHERE kind = ? AND key = ?", (kind, key)).fetchone()
+        if not row:
+            return None
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(row["created_at"])
+        if age.total_seconds() > max_age_hours * 3600:
+            return None
+        return json.loads(row["value_json"])
+
+    def cache_put(self, kind: str, key: str, value) -> None:
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO cache (kind, key, created_at, value_json) VALUES (?,?,?,?)",
+                      (kind, key, now(), json.dumps(value, default=str)))
+
+    # ---- batches ----------------------------------------------------------
+    def create_batch(self, name: str) -> str:
+        bid = uuid.uuid4().hex[:8]
+        with self._conn() as c:
+            c.execute("INSERT INTO batches (id, created_at, name) VALUES (?,?,?)", (bid, now(), name))
+        return bid
+
+    def add_to_batch(self, batch_id: str, run_id: str) -> None:
+        with self._conn() as c:
+            row = c.execute("SELECT run_ids FROM batches WHERE id = ?", (batch_id,)).fetchone()
+            ids = json.loads(row["run_ids"]) if row else []
+            ids.append(run_id)
+            c.execute("UPDATE batches SET run_ids = ? WHERE id = ?", (json.dumps(ids), batch_id))
+
+    def list_batches(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM batches ORDER BY created_at DESC").fetchall()
+        return [dict(r) | {"run_ids": json.loads(r["run_ids"])} for r in rows]
 
     # ---- stages -----------------------------------------------------------
     def stage_started(self, run_id: str, stage_no: int, name: str) -> None:

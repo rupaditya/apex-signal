@@ -15,7 +15,8 @@ from .db import RunStore
 from .llm import BaseLLM, LLMError
 from .schemas import (AngleRationale, EmailDraft, ExtractionResult, IdentityExtraction,
                       ValidationVerdict)
-from .search import SearchError, SearchResult, domain_of
+from .fetch import fetch_many, select_passages
+from .search import CachedSearch, SearchError, SearchResult, domain_of
 
 SELLER = ("Apex (fictional) sells accounts-payable automation for mid-market finance teams: invoice capture "
           "and processing, 2/3-way PO matching, approval routing, and exception management.")
@@ -40,6 +41,9 @@ class ProspectInput:
     company_name: str
     prospect_role: str
     company_website: Optional[str] = None
+    rep_confirmed: bool = False          # rep vouches this is the right person (e.g. checked LinkedIn)
+    parent_run_id: Optional[str] = None  # set when re-running a NEEDS_INPUT run with the rep's answer
+    batch_id: Optional[str] = None
 
 
 class StageFailed(Exception):
@@ -48,8 +52,12 @@ class StageFailed(Exception):
 
 class Pipeline:
     def __init__(self, store: RunStore, search, llm: BaseLLM, today: Optional[date] = None,
-                 max_sources: int = 14, on_event: Optional[Event] = None):
-        self.store, self.search, self.llm = store, search, llm
+                 max_sources: int = 14, on_event: Optional[Event] = None, fetch_pages: bool = True,
+                 use_cache: bool = True):
+        self.store, self.llm = store, llm
+        self.search = CachedSearch(search, store) if use_cache and not isinstance(search, CachedSearch) else search
+        self.fetch_pages = fetch_pages
+        self.use_cache = use_cache
         self.today = today or date.today()
         self.max_sources = max_sources
         self.on_event = on_event or (lambda *a: None)
@@ -105,8 +113,9 @@ class Pipeline:
     def _sources_block(sources: dict) -> str:
         parts = []
         for sid, s in sources.items():
+            text = s.get("passage") or s["content"][:1800]
             parts.append(f"[{sid}] {s['title']}\nURL: {s['url']}\nPublished: {s.get('published_date') or 'unknown'}\n"
-                         f"TEXT: {s['content'][:3500]}")
+                         f"TEXT: {text}")
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------ main
@@ -114,6 +123,10 @@ class Pipeline:
         providers = f"search={getattr(self.search, 'name', '?')}; llm={self.llm.name}:{self.llm.model}"
         run_id = self.store.create_run(inp.prospect_name, inp.company_name, inp.prospect_role,
                                        inp.company_website, providers)
+        if inp.parent_run_id or inp.batch_id:
+            self.store.update_run(run_id, parent_run_id=inp.parent_run_id, batch_id=inp.batch_id)
+        if inp.batch_id:
+            self.store.add_to_batch(inp.batch_id, run_id)
         try:
             self._execute(run_id, inp)
         except StageFailed as e:
@@ -137,6 +150,8 @@ class Pipeline:
         raise StageFailed(f"Stage {no} failed: {msg}")
 
     def _execute(self, run_id: str, inp: ProspectInput):
+        if isinstance(self.search, CachedSearch):
+            self.search.hits = 0
         company, person, role = inp.company_name.strip(), inp.prospect_name.strip(), inp.prospect_role.strip()
         site_domain = domain_of(inp.company_website) if inp.company_website else None
         sources: dict[str, dict] = {}
@@ -163,6 +178,8 @@ class Pipeline:
         if all(l["error"] for l in id_log):
             self._fail(run_id, 1, "All identity searches failed: " + id_log[0]["error"], {"queries": id_log})
         register(self._dedupe(id_results))
+        for src in sources.values():
+            src["passage"] = select_passages(src["content"], [person, company], max_chars=1200)
         if sources:
             try:
                 ident_x = self.llm.call_json(
@@ -180,7 +197,8 @@ class Pipeline:
                 self._fail(run_id, 1, str(e), {"queries": id_log})
         else:
             ident_x = IdentityExtraction()
-        identity = policy.decide_identity(ident_x, sources, company, person, role, inp.company_website)
+        identity = policy.decide_identity(ident_x, sources, company, person, role, inp.company_website,
+                                           rep_confirmed=inp.rep_confirmed)
         self._finish(run_id, 1, "DONE",
                      f"Company: {identity.company_status} · Prospect: {identity.prospect_status}",
                      {"queries": id_log, "extraction": ident_x.model_dump(), "decision": identity.to_dict()})
@@ -211,21 +229,41 @@ class Pipeline:
             self._fail(run_id, 2, "All research searches failed (search provider unavailable).", {"queries": log})
         before = len(sources)
         register(self._dedupe(res))
-        self._finish(run_id, 2, "DONE",
-                     f"{len(queries)} queries · {len(sources) - before} new sources · {failures} failed",
-                     {"queries": log, "sources": [{k: v for k, v in s.items() if k != "content"} | {"chars": len(s["content"])}
-                                                  for s in sources.values()]})
-
-        # ---------------- Stage 3: extract
-        self._start(run_id, 3)
         ordered = sorted(sources.values(), key=lambda s: (policy.source_tier(s["url"], identity.company_domain) == "C",
                                                           not policy.mentions_company(s["content"] + s["title"], company, identity.company_domain)))
         picked = {s["id"]: s for s in ordered[: self.max_sources]}
+        # read the real pages behind the most promising results (free; recovers full text + publish dates)
+        read_ok = 0
+        if self.fetch_pages and picked:
+            pages = fetch_many([s["url"] for s in picked.values()], cache=self.store if self.use_cache else None)
+            for src in picked.values():
+                pg = pages.get(src["url"]) or {}
+                src["fetch"] = "read" if pg.get("ok") else (pg.get("error") or "not read")
+                if pg.get("ok"):
+                    read_ok += 1
+                    src["content"] = (src["content"] + " \n " + pg["text"]).strip()
+                if not src.get("published_date") and pg.get("published_date"):
+                    src["published_date"] = pg["published_date"]
+                    src["date_from"] = "page metadata"
+        cache_hits = getattr(self.search, "hits", 0)
+        self._finish(run_id, 2, "DONE",
+                     f"{len(queries)} queries · {len(sources) - before} new sources · {read_ok} pages read"
+                     + (f" · {cache_hits} cached" if cache_hits else "") + f" · {failures} failed",
+                     {"queries": log, "cached_queries": cache_hits,
+                      "sources": [{k: v for k, v in s.items() if k not in ("content", "passage")} | {"chars": len(s["content"])}
+                                  for s in sources.values()]})
+
+        # ---------------- Stage 3: extract
+        self._start(run_id, 3)
+        must = [policy.company_core(company), company, person] + ([identity.company_domain.split(".")[0]] if identity.company_domain else [])
+        for src in picked.values():
+            src["passage"] = select_passages(src["content"], must, max_chars=1500)
         observations, facts, errors = [], [], []
         if picked:
             ids = list(picked)
-            for i in range(0, len(ids), 7):
-                batch = {k: picked[k] for k in ids[i:i + 7]}
+            size = 14 if sum(len(picked[k]["passage"]) for k in ids) < 16000 else 7
+            for i in range(0, len(ids), size):
+                batch = {k: picked[k] for k in ids[i:i + size]}
                 try:
                     x = self.llm.call_json(
                         "extract",
@@ -246,7 +284,7 @@ class Pipeline:
                     facts += x.facts
                 except LLMError as e:
                     errors.append(str(e))
-            if errors and not observations and len(errors) == (len(ids) + 6) // 7:
+            if errors and not observations and len(errors) == (len(ids) + size - 1) // size:
                 self._fail(run_id, 3, "Extraction failed: " + errors[0])
         self._finish(run_id, 3, "DONE",
                      f"{len(observations)} observations · {len(facts)} facts from {len(picked)} sources"
@@ -299,7 +337,9 @@ class Pipeline:
         allowed_ids = {e.id for e in ev}
         evidence_text = "\n".join(f"{e.quote} {e.observation} {e.published_date or ''}" for e in ev)
         # numbers/claims are checked against the full text of the cited sources, not just the quote
-        cited_text = evidence_text + "\n" + "\n".join(sources[e.source_id]["content"] for e in ev)
+        source_only = "\n".join([e.quote for e in ev] + [sources[e.source_id]["content"] for e in ev])
+        cited_text = evidence_text + "\n" + source_only
+        allowed_text = cited_text + "\n" + SELLER  # seller facts (e.g. '2/3-way matching') are ours to state
         first_name = person.split()[0]
         personal_ok = identity.prospect_status == "CONFIRMED"
         draft_prompt = (
@@ -334,7 +374,7 @@ class Pipeline:
         self._start(run_id, 7)
         attempts = []
         for attempt in range(2):
-            problems = policy.deterministic_draft_checks(draft, allowed_ids, cited_text, conflicts)
+            problems = policy.deterministic_draft_checks(draft, allowed_ids, allowed_text, conflicts, source_text=source_only)
             try:
                 verdict = self.llm.call_json(
                     "validate",

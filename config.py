@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-LLM_ORDER = ["gemini", "groq", "openrouter", "anthropic", "openai"]
+LLM_ORDER = ["groq", "gemini", "openrouter", "anthropic", "openai"]  # Groq first: Gemini free quota proved too small in live runs
 
 
 def _env(name: str, default: str = "") -> str:
@@ -26,6 +26,7 @@ class Settings:
     db_path: str
     http_timeout: float
     max_sources_for_extraction: int
+    fetch_pages: bool = True
 
     # back-compat helpers used by the UI
     @property
@@ -78,4 +79,5 @@ def load_settings() -> Settings:
         db_path=_env("APEX_DB_PATH", "apex_signal.db"),
         http_timeout=float(_env("HTTP_TIMEOUT", "30")),
         max_sources_for_extraction=int(_env("MAX_SOURCES", "14")),
+        fetch_pages=_env("APEX_FETCH_PAGES", "1") != "0",
     )

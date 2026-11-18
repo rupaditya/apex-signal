@@ -12,14 +12,24 @@ exception management). Buyers are CFOs, Finance Directors, Controllers and AP le
 
 ---
 
+### What it does for an SDR
+
+- **One prospect** (New run) with a live 8-stage view, or **a whole list** (Batch: paste/upload CSV, export results).
+- Every outcome explains itself: the hook it chose, the **other hooks it considered and why they lost**, and the
+  evidence it excluded (with reasons).
+- When it can't tell who someone is, it **stops and asks**, then resumes with one click ("Use beca.com" / "I've
+  confirmed this person").
+- An **Evaluation** page runs a labelled set of real prospects live and scores the judgement (outcome accuracy,
+  drafts passing validation, correct abstentions, speed).
+
 ## 1. Cost: ₹0
 
 Every component runs on a free tier that needs **no credit card**:
 
 | Need | Provider | Free allowance | Get a key |
 |---|---|---|---|
-| LLM (primary) | Google Gemini (`gemini-3-flash-preview`) | Free tier, rate-limited per minute/day | aistudio.google.com/apikey |
-| LLM (automatic backup) | Groq (`openai/gpt-oss-120b`) | Free tier, rate-limited | console.groq.com/keys |
+| LLM (backup) | Google Gemini (`gemini-3-flash-preview`) | Free tier, rate-limited per minute/day | aistudio.google.com/apikey |
+| LLM (primary) | Groq (`openai/gpt-oss-120b`) | Free tier, rate-limited | console.groq.com/keys |
 | Web search (primary) | Tavily | 1,000 credits/month (basic search = 1 credit) | app.tavily.com |
 | LLM (last resort) | OpenRouter free models (`openrouter/free`) | ~50 requests/day, free models only | openrouter.ai/keys |
 | Web search (backup) | Serper (Google results) | One-time free query allowance | serper.dev |
@@ -27,8 +37,10 @@ Every component runs on a free tier that needs **no credit card**:
 | Hosting | Streamlit Community Cloud | Free public apps | share.streamlit.io |
 | Code | GitHub | Free | github.com |
 
-A run uses about 10 searches and 6–8 LLM calls, so the free tiers cover roughly 100 runs a month. If Gemini's
-quota is hit, the run continues on Groq, then OpenRouter; if Tavily credits run out, it continues on Serper, then
+A run uses about 10 searches and 6–8 LLM calls, so the free tiers cover roughly 100 runs a month. Groq is tried first (Gemini's free quota proved
+too small in live stress tests); on a rate limit the app first tries the same provider's other free models
+(separate quotas), then the next provider, and skips a rate-limited provider for 10 minutes instead of retrying it
+on every call; if Tavily credits run out, it continues on Serper, then
 DuckDuckGo. If a provider retires a model id, the app lists that provider's models and switches to the closest
 available one (OpenRouter: free models only, so nothing can ever be billed). Fallbacks are
 recorded on the run. Note: Google may use free-tier Gemini API traffic to improve its products — only public web
@@ -90,7 +102,10 @@ apex_signal/
   schemas.py               Pydantic contracts for every LLM call
   llm.py                   Gemini / Groq (OpenAI-compatible) + Anthropic/OpenAI; JSON-only, schema-validated,
                            one corrective retry, automatic provider fallback
-  search.py                Tavily -> DuckDuckGo fallback (Serper optional); failures raise SearchError
+  search.py                Tavily -> Serper -> DuckDuckGo fallback; 24h SQLite cache (CachedSearch)
+  fetch.py                 Reads the real source pages (free) + publish dates from page metadata; selects the
+                           sentences that matter (company/person/finance signals) so prompts stay ~3x smaller
+  evalset.py               Labelled real prospects with expected outcomes (used by the Evaluation page)
   db.py                    SQLite: runs + per-stage JSON outputs
 scripts/live_run.py        CLI live run
 tests/                     pytest suite; tests/fixtures.py = LABELLED synthetic data, never used by the app
@@ -105,12 +120,12 @@ which hook wins; draft or abstain). This keeps every decision explainable and te
 | # | Stage | What actually happens |
 |---|---|---|
 | 1 | Identify | 3 searches (person+company, person+role+company, company site). LLM lists company candidates & person mentions with verbatim quotes. Rules decide company status (PROVIDED / RESOLVED / AMBIGUOUS / UNRESOLVED) and prospect status (CONFIRMED / ROLE_MISMATCH / NOT_FOUND / AMBIGUOUS / CONFLICTING). Blocking ambiguity stops the run here. |
-| 2 | Research | 6–7 parallel searches targeted at AP-relevant signals: company news, AP/finance job postings, ERP/finance-system changes, finance leadership changes, M&A/expansion, prospect interviews, first-party press pages. Partial search failures are recorded; total failure fails the run. |
-| 3 | Extract | LLM extracts observations (verbatim quote, neutral statement, signal type, subject) and key facts (CFO name, ERP, employer, headcount, …) per source, in batches. |
+| 2 | Research | 6–7 parallel searches targeted at AP-relevant signals (news, AP/finance jobs, ERP changes, finance leadership, M&A/expansion, prospect interviews, first-party press). Then the top ~14 result pages are **actually read** (free HTTP fetch, 72h cache) to get full text and publish dates. Searches are cached for 24h, so reruns cost nothing. |
+| 3 | Extract | Per source, only the relevant sentences are kept (passage selection); the LLM extracts observations (verbatim quote, neutral statement, signal type, subject) and key facts (CFO name, ERP, employer, headcount, …), usually in one call. |
 | 4 | Evaluate | Each observation gets categorical labels: grounded? tier A/B/C? fresh/aging/stale/undated? about target? relevance DIRECT/INDIRECT/NONE? depends on a conflicting fact? Every exclusion is recorded with a reason. |
 | 5 | Select angle | Rule-based outcome (see policy). If drafting, the top eligible item is chosen by an ordered rule (not a score); the LLM writes hook / hypothesis / product relevance / assumptions. |
 | 6 | Draft | LLM writes 60–120 words using only the selected evidence; returns each sentence with its kind and cited evidence ids. Unverified prospects get no personal claims. |
-| 7 | Validate | Deterministic checks (citations, numbers must appear in cited sources, length, banned phrases, no conflicted values, no URLs) + LLM sentence-level fact-check. One automatic repair pass; remaining issues are flagged, not hidden. |
+| 7 | Validate | Deterministic checks (citations; numbers must appear in cited sources or the seller description; no 9-word copy of a source; sign-off must be the `[Your name]` placeholder; length; banned phrases; no conflicted values; no URLs) + LLM sentence-level fact-check. One automatic repair pass; remaining issues are flagged, not hidden. |
 | 8 | Review | Draft saved as PENDING_REVIEW. Reviewer edits, saves, approves *for manual send* or rejects. Original draft is kept alongside edits. |
 
 ## 6. Decision policy (explicit rules, no confidence scores)
@@ -133,6 +148,18 @@ LinkedIn). Tier C can never support a hook or establish identity.
 **Conflicts** — two grounded tier A/B sources giving different values for the same fact key (e.g. two different
 CFO names; headcounts differing > 50%). Hooks that depend on a conflicted fact are excluded, and conflicted values
 are banned from the draft. Conflicting prospect employment blocks the run.
+
+**Rules added after live stress testing (each one came from a real failure)**
+
+- *Funding is funding.* An "expansion" or "growth" claim that comes from a funding announcement ("will use the fresh
+  capital to expand…") is reclassified as funding in code — a prompt instruction alone was ignored by the model.
+- *Don't stack guesses.* An INDIRECT hook sent to someone outside the finance persona (or whose identity isn't
+  verified) is two unverified assumptions in a row → abstain and recommend redirecting to finance.
+- *Career history isn't a conflict.* An earlier, different role at the same company (Group Finance Director → CFO) is
+  history; only a source calling the *same* role "former" counts as a conflict.
+- *Never put the source's words in our mouth.* Drafts that copy 9+ consecutive words from a source fail validation
+  (this caught a draft that pasted the prospect's own quote — "has helped *us*…" — as if the seller said it).
+- *No invented sender.* The sign-off must be `[Your name]`; a model once signed as "Alex".
 
 **Outcome rules (first match wins)**
 
@@ -159,14 +186,16 @@ LLM/API errors, search outages, unsupported numbers in drafts (automatic repair)
 
 ## 8. Demo script (5 minutes)
 
-1. **Happy path** — a mid-market company with a recent public finance-systems or AP-hiring signal, with the
-   website filled in. Show the live stages, the Decision tab's four categories, the cited evidence, then edit and approve the draft.
-2. **Ambiguity** — a common company name *without* website (e.g. "Apex Solutions") → stops at stage 1 and lists the candidate organisations. Re-run with the website.
-3. **Low relevance** — a company whose only recent news is funding/product launches → abstains and says why.
-4. **No evidence** — a fabricated person and company → abstains; show the rejected items / empty searches.
-5. Open **Run history** to show every run, status, outcome and review state.
+1. **Happy path** (New run): Mark Fleming · Beca · CFO · https://www.beca.com — verified CFO, fresh public signal
+   about Beca's Oracle finance transformation. Walk the Decision tab (four boxes + other hooks considered), the
+   Evidence tab (exclusions with reasons), edit and approve the draft.
+2. **Ambiguity** (New run): Sam Lee · Apex Solutions · Controller, no website → stops at stage 1, lists the matching
+   companies; click one to resume (linked re-run).
+3. **The SDR's real job** (Batch): click *Fill example rows* → *Run batch*; show the progress table, outcome tiles and
+   CSV export. Includes a correct low-relevance abstention (Revspot: funding news only, founder not a finance buyer).
+4. **Proof** (Evaluation): open the last evaluation scorecard — outcome accuracy across the labelled real prospects.
 
-Live search results change daily, so pick and rehearse demo prospects the day of the demo.
+Repeated runs within 24h use cached searches, so rehearsals don't burn free quota and the live demo is fast.
 
 ## 9. Known limitations
 
@@ -177,7 +206,8 @@ Live search results change daily, so pick and rehearse demo prospects the day of
 - Company disambiguation relies on the LLM listing candidates; same-root domains (acme.com / acme.co.uk) are merged and treated as one organisation.
 - Role matching uses keyword families (CFO / controller / finance leader / AP); unusual titles may be marked ROLE_MISMATCH (safe failure: no role claims).
 - The LLM fact-check is itself a model judgement; the deterministic checks are the hard guarantees.
-- Runs execute synchronously in the Streamlit session (~30–90 s); a closed tab mid-run leaves the run in RUNNING.
+- Runs execute synchronously in the Streamlit session (~40–90 s each; batches run sequentially); a closed tab mid-run leaves the run in RUNNING.
+- Page reading skips sites that block bots (LinkedIn, Glassdoor) and JS-only pages; those fall back to search snippets.
 - SQLite on Streamlit Cloud is ephemeral; use a persistent volume or Postgres for production.
 - No email sending, CRM sync or multi-user auth by design.
 

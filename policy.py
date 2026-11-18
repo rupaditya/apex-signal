@@ -205,7 +205,7 @@ def employer_matches(employer: str, company_name: str, company_domain: Optional[
 
 
 def decide_identity(extraction, sources: dict, company_name: str, prospect_name: str, role: str,
-                    website: Optional[str]) -> IdentityDecision:
+                    website: Optional[str], rep_confirmed: bool = False) -> IdentityDecision:
     reasons: list[str] = []
     # --- company
     if website:
@@ -291,8 +291,17 @@ def decide_identity(extraction, sources: dict, company_name: str, prospect_name:
     if not persona_fit:
         reasons.append(f"Role '{role}' is outside the AP-automation buyer persona (CFO/Controller/Finance/AP).")
 
+    if rep_confirmed and prospect_status in ("AMBIGUOUS", "CONFLICTING", "NOT_FOUND"):
+        reasons.append(f"Rep confirmed {prospect_name}'s identity manually (public sources: {prospect_status}). "
+                       "Treated as unverified for personal claims; the email stays company-level.")
+        prospect_status = "REP_CONFIRMED"
     blocking = company_status == "AMBIGUOUS" or prospect_status in ("AMBIGUOUS", "CONFLICTING")
     return IdentityDecision(company_status, company_domain, prospect_status, persona_fit, reasons, blocking)
+
+
+FUNDING_RE = re.compile(r"\b(series [a-f]\b|seed round|pre-seed|raised|raises|raising|funding round|fresh capital|"
+                        r"the (fresh |new )?funds|proceeds|capital infusion|investment led by|led by [\w\s&]+ (ventures|capital|partners))",
+                        re.I)
 
 
 # ---------------------------------------------------------------- evidence
@@ -380,8 +389,12 @@ def assess_evidence(observations, sources: dict, company_name: str, company_doma
             src["content"] + " " + src["title"], company_name, company_domain)
         if o.subject == "prospect" and identity.prospect_status != "CONFIRMED":
             entity_ok = False
-        relevance = RELEVANCE.get(o.signal_type, "NONE")
-        conflicted = sorted(SIGNAL_DEPENDS_ON.get(o.signal_type, set()) & set(conflicts))
+        signal_type, note = o.signal_type, None
+        if signal_type in ("expansion", "rapid_growth") and FUNDING_RE.search(o.quote + " " + o.observation):
+            # "we'll use the money to expand" is part of the funding news, not an operational change
+            signal_type, note = "funding", f"Reclassified {o.signal_type} → funding (plan stated in a funding announcement)."
+        relevance = RELEVANCE.get(signal_type, "NONE")
+        conflicted = sorted(SIGNAL_DEPENDS_ON.get(signal_type, set()) & set(conflicts))
         ex = []
         if not grounded:
             ex.append("Quote not found in retrieved source text (possible model hallucination).")
@@ -392,12 +405,12 @@ def assess_evidence(observations, sources: dict, company_name: str, company_doma
         if rec == "stale":
             ex.append(f"Stale (> {AGING_DAYS // 365} years old).")
         if relevance == "NONE":
-            ex.append(f"No product relevance ({o.signal_type}).")
+            ex.append(f"No product relevance ({signal_type})." + (f" {note}" if note else ""))
         if conflicted:
             ex.append(f"Depends on conflicting facts: {', '.join(conflicted)}.")
         items.append(EvidenceItem(
             id=f"E{i}", source_id=o.source_id, url=src["url"], domain=domain_of(src["url"]), title=src["title"],
-            published_date=pub, quote=o.quote, observation=o.observation, signal_type=o.signal_type,
+            published_date=pub, quote=o.quote, observation=o.observation, signal_type=signal_type,
             subject=o.subject, tier=tier, recency=rec, relevance=relevance, grounded=grounded,
             entity_ok=entity_ok, conflicted_keys=conflicted, eligible=not ex, exclusions=ex,
         ))
@@ -429,11 +442,26 @@ class AngleDecision:
     primary: Optional[EvidenceItem] = None
     supporting: list[EvidenceItem] = field(default_factory=list)
     caveats: list[str] = field(default_factory=list)
+    alternatives: list[dict] = field(default_factory=list)
 
     def to_dict(self):
         return {"outcome": self.outcome, "label": OUTCOMES[self.outcome], "reason": self.reason,
                 "primary": self.primary.id if self.primary else None,
-                "supporting": [s.id for s in self.supporting], "caveats": self.caveats}
+                "supporting": [s.id for s in self.supporting], "caveats": self.caveats,
+                "alternatives": self.alternatives}
+
+
+def why_lower(winner: "EvidenceItem", other: "EvidenceItem") -> str:
+    """Explain, in the order the ranking rule applies, why `other` lost to `winner`."""
+    if winner.relevance != other.relevance:
+        return f"{other.relevance} relevance vs {winner.relevance}"
+    if winner.tier != other.tier:
+        return f"tier {other.tier} source vs tier {winner.tier}"
+    if winner.recency != other.recency:
+        return f"{other.recency} vs {winner.recency}"
+    if winner.subject != other.subject:
+        return "about the company, not the prospect"
+    return "older than the winning signal"
 
 
 def select_angle(items: list[EvidenceItem], identity: IdentityDecision, conflicts: dict,
@@ -476,6 +504,16 @@ def select_angle(items: list[EvidenceItem], identity: IdentityDecision, conflict
         return AngleDecision("ABSTAIN_NO_CREDIBLE_EVIDENCE", msg)
 
     primary = eligible[0]
+    alternatives = [{"id": e.id, "signal_type": e.signal_type, "relevance": e.relevance, "tier": e.tier,
+                     "recency": e.recency, "observation": e.observation, "why_lower": why_lower(primary, e)}
+                    for e in eligible[1:5]]
+    if primary.relevance == "INDIRECT" and (not identity.persona_fit or identity.prospect_status != "CONFIRMED"):
+        who = ("the recipient is outside the finance buyer persona" if not identity.persona_fit
+               else f"the prospect could not be verified ({identity.prospect_status})")
+        return AngleDecision("ABSTAIN_LOW_RELEVANCE",
+                             f"Best signal is INDIRECT ({primary.signal_type}: {primary.observation}) and {who}. "
+                             "Two unverified assumptions stacked is not a defensible reason to reach out; "
+                             "redirect to a finance contact or nurture.", alternatives=alternatives)
     supporting = [e for e in eligible[1:] if e.source_id != primary.source_id][:2]
     caveats = []
     if primary.relevance == "INDIRECT":
@@ -497,7 +535,7 @@ def select_angle(items: list[EvidenceItem], identity: IdentityDecision, conflict
     outcome = "DRAFT_WITH_CAVEATS" if caveats else "DRAFT_READY"
     return AngleDecision(outcome, f"Strongest eligible signal: {primary.id} ({primary.signal_type}, "
                                   f"{primary.relevance}, tier {primary.tier}, {primary.recency}).",
-                         primary, supporting, caveats)
+                         primary, supporting, caveats, alternatives)
 
 
 # ---------------------------------------------------------------- draft checks
@@ -507,7 +545,10 @@ MAX_BODY_WORDS = 150
 VERBATIM_WORDS = 9
 
 
-def deterministic_draft_checks(draft, allowed_ids: set[str], evidence_text: str, conflicts: dict) -> list[str]:
+def deterministic_draft_checks(draft, allowed_ids: set[str], evidence_text: str, conflicts: dict,
+                               source_text: Optional[str] = None) -> list[str]:
+    """evidence_text: everything the draft may draw facts/numbers from (sources, our observations, seller description).
+    source_text: only what third parties actually wrote – used for the copy-paste check."""
     problems = []
     words = len(draft.body.split())
     if words > MAX_BODY_WORDS:
@@ -536,11 +577,14 @@ def deterministic_draft_checks(draft, allowed_ids: set[str], evidence_text: str,
                 problems.append(f"Mentions a conflicted fact value ({key}: {v['value']}).")
     if "http" in low:
         problems.append("Contains a URL.")
+    if "[your name]" not in low:
+        problems.append("Sign-off must be the placeholder '[Your name]' – never an invented sender name.")
     # quoting a source word-for-word reads as plagiarism (and can put someone else's "we/us" in our mouth)
+    src = norm(source_text) if source_text is not None else ev
     bw = norm(draft.body).split()
     for i in range(len(bw) - VERBATIM_WORDS + 1):
         span = " ".join(bw[i:i + VERBATIM_WORDS])
-        if span in ev:
+        if span in src:
             problems.append(f"Copies source text verbatim (\"{span}…\"); paraphrase it in our own words.")
             break
     return problems

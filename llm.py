@@ -114,8 +114,14 @@ class OpenAICompatLLM(BaseLLM):
             return None
         return ids[0] if ids else None
 
-    def _create(self, system, user):
-        kwargs = dict(model=self.model, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+    # other free models on the same key, each with its own rate-limit bucket
+    ALT_MODELS_ON_429 = {
+        "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
+        "groq": ["openai/gpt-oss-20b"],
+    }
+
+    def _create(self, system, user, model=None):
+        kwargs = dict(model=model or self.model, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
         if not getattr(self, "_no_json_mode", False):
             kwargs["response_format"] = {"type": "json_object"}
         if self.name != "gemini":  # Google recommends default temperature for Gemini 3
@@ -130,9 +136,34 @@ class OpenAICompatLLM(BaseLLM):
                 return self.client.chat.completions.create(**kwargs)
             raise
 
+    def _with_rotation(self, system, user, task):
+        """Try the configured model; on a 429, try this provider's other free models (separate quotas)."""
+        import time
+        if not hasattr(self, "_model_cooldown"):
+            self._model_cooldown = {}
+        models = [self.model] + [m for m in self.ALT_MODELS_ON_429.get(self.name, []) if m != self.model]
+        last = None
+        for m in models:
+            if self._model_cooldown.get(m, 0) > time.time():
+                continue
+            try:
+                resp = self._create(system, user, model=m)
+                if m != self.model:
+                    note = f"{self.name}: '{self.model}' rate-limited, used '{m}'"
+                    if note not in self.notes:
+                        self.notes.append(note)
+                return resp
+            except Exception as e:
+                last = e
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    self._model_cooldown[m] = time.time() + 120
+                    continue
+                raise
+        raise last or RuntimeError("Error code: 429 – all models rate-limited")
+
     def complete(self, system: str, user: str, task: str) -> str:
         try:
-            resp = self._create(system, user)
+            resp = self._with_rotation(system, user, task)
         except Exception as e:
             msg = str(e)
             if ("404" in msg or "not found" in msg.lower() or "does not exist" in msg.lower()) and not getattr(self, "_rediscovered", False):

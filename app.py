@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import os
+import io
 import time
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -15,14 +16,17 @@ try:
             os.environ[_k] = _v
 except Exception:
     pass
+
 import sys, types  # flat repo layout: treat the repo root as the apex_signal package
 if not os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "apex_signal")):
     _pkg = types.ModuleType("apex_signal")
     _pkg.__path__ = [os.path.dirname(os.path.abspath(__file__))]
     sys.modules.setdefault("apex_signal", _pkg)
+
 from apex_signal.config import load_settings
 from apex_signal.db import RunStore
 from apex_signal.llm import build_llm
+from apex_signal.evalset import EVAL_CASES
 from apex_signal.pipeline import STAGES, Pipeline, ProspectInput
 from apex_signal.policy import OUTCOMES
 from apex_signal.search import build_search_client
@@ -150,7 +154,7 @@ def stage_row(no, name, status, summary="", elapsed=None):
 with st.sidebar:
     st.markdown('<div class="brand"><div class="logo">◆</div>Apex Signal</div>', unsafe_allow_html=True)
     st.caption("Evidence-first prospect research & outreach drafts for AP automation.")
-    view = st.radio("View", ["New run", "Run history"], label_visibility="collapsed", key="view")
+    view = st.radio("View", ["New run", "Batch", "Run history", "Evaluation"], label_visibility="collapsed", key="view")
     st.divider()
     missing = settings.missing_credentials()
     search_ok = bool(settings.search_chain)
@@ -197,6 +201,11 @@ def render_run(run_id: str):
         box = st.success if run["outcome"] == "DRAFT_READY" else st.warning if run["outcome"] == "DRAFT_WITH_CAVEATS" else st.info
         box(run["outcome_reason"])
 
+    if run.get("outcome") == "NEEDS_INPUT_AMBIGUOUS_IDENTITY":
+        render_resolution(run, s1)
+    if run.get("parent_run_id"):
+        st.caption(f"Re-run of `{run['parent_run_id']}` with the rep's answer.")
+
     tabs = st.tabs(["Decision", "Evidence & sources", "Draft & review", "Stage log"])
 
     # --- Decision
@@ -228,6 +237,13 @@ def render_run(run_id: str):
             st.markdown(f'<div class="card pink">{rat.get("hypothesis", "—")}</div>', unsafe_allow_html=True)
             st.markdown("##### 3 · Relevance to the seller's product")
             st.markdown(f'<div class="card lime">{rat.get("product_relevance", "—")}</div>', unsafe_allow_html=True)
+        alts = s5.get("alternatives") or []
+        if alts:
+            with st.expander(f"Other hooks considered ({len(alts)}) – and why they ranked lower"):
+                st.dataframe(pd.DataFrame([{"id": a["id"], "signal": a["signal_type"], "relevance": a["relevance"],
+                                            "tier": a["tier"], "recency": a["recency"], "observation": a["observation"],
+                                            "ranked lower because": a["why_lower"]} for a in alts]),
+                             hide_index=True, width="stretch")
         st.markdown("##### 4 · Unsupported assumptions & evidence limitations")
         lims = list(rat.get("assumptions", [])) + list(s5.get("caveats", []))
         excluded = [e for e in s4.get("evidence", []) if not e["eligible"]]
@@ -258,8 +274,10 @@ def render_run(run_id: str):
         if srcs:
             with st.expander(f"All retrieved sources ({len(srcs)})"):
                 for sid, s in srcs.items():
-                    st.markdown(f"**{sid}** [{s['title'] or s['url']}]({s['url']}) · {s.get('published_date') or 'undated'} "
-                                f"· query: _{s.get('query', '')}_")
+                    read = {"read": " · 📄 page read"}.get(s.get("fetch"), f" · snippet only ({s['fetch']})" if s.get("fetch") else "")
+                    dated = f" (date from {s['date_from']})" if s.get("date_from") else ""
+                    st.markdown(f"**{sid}** [{s['title'] or s['url']}]({s['url']}) · {s.get('published_date') or 'undated'}{dated}"
+                                f"{read} · query: _{s.get('query', '')}_")
 
     # --- Draft
     with tabs[2]:
@@ -311,65 +329,283 @@ def render_run(run_id: str):
                 st.code(run["error"])
 
 
+# ------------------------------------------------------------------ shared runners
+def queue_rerun(run, website=None, rep_confirmed=False):
+    """Button callback: queue a re-run with the rep's answer and jump to the live view."""
+    st.session_state["pending"] = dict(prospect_name=run["prospect_name"], company_name=run["company_name"],
+                                       prospect_role=run["prospect_role"],
+                                       company_website=website or run.get("company_website"),
+                                       rep_confirmed=rep_confirmed, parent_run_id=run["id"])
+    st.session_state["view"] = "New run"
+
+
+def render_resolution(run, s1):
+    cands = [c for c in (s1.get("extraction") or {}).get("company_candidates", []) if c.get("domain")]
+    st.markdown('<div class="card pink"><h4>Resolve and continue</h4>The process stopped instead of guessing. '
+                'Pick the right organisation, or confirm the person yourself, and it re-runs with your answer '
+                '(the new run is linked to this one).</div>', unsafe_allow_html=True)
+    cols = st.columns(min(max(len(cands), 1), 3) + 1)
+    for i, c in enumerate(cands[:3]):
+        cols[i].button(f"Use {c['domain']}", key=f"res_{run['id']}_{i}", help=c.get("description", ""),
+                       on_click=queue_rerun, args=(run,), kwargs={"website": "https://" + c["domain"]})
+    cols[-1].button("I've confirmed this person – continue", key=f"conf_{run['id']}",
+                    on_click=queue_rerun, args=(run,), kwargs={"rep_confirmed": True})
+
+
+def make_pipeline(on_event=None):
+    return Pipeline(store, build_search_client(settings), build_llm(settings),
+                    max_sources=settings.max_sources_for_extraction, on_event=on_event,
+                    fetch_pages=settings.fetch_pages)
+
+
+def run_with_live_view(inp: ProspectInput):
+    st.markdown('<div class="sec">Live execution</div>', unsafe_allow_html=True)
+    slots = {no: st.empty() for no, _ in STAGES}
+    started = {}
+    for no, name in STAGES:
+        slots[no].markdown(stage_row(no, name, "PENDING", "Waiting"), unsafe_allow_html=True)
+
+    def on_event(no, name, status, summary, output):
+        if status == "RUNNING":
+            started[no] = time.time()
+            slots[no].markdown(stage_row(no, name, "RUNNING", "Running…"), unsafe_allow_html=True)
+        else:
+            el = time.time() - started.get(no, time.time())
+            slots[no].markdown(stage_row(no, name, status, summary, el), unsafe_allow_html=True)
+
+    try:
+        return make_pipeline(on_event).run(inp)
+    except Exception as e:
+        st.error(f"Could not start run: {e}")
+        return None
+
+
+def duration_s(r):
+    try:
+        return (datetime.fromisoformat(r["updated_at"]) - datetime.fromisoformat(r["created_at"])).total_seconds()
+    except Exception:
+        return None
+
+
+def runs_table(runs):
+    return pd.DataFrame([{
+        "run": r["id"], "prospect": r["prospect_name"], "company": r["company_name"], "role": r["prospect_role"],
+        "status": r["status"], "outcome": OUTCOMES.get(r["outcome"] or "", r["outcome"] or (r["error"] or "")[:60]),
+        "review": r["review_status"], "seconds": round(duration_s(r) or 0),
+        "subject": r["edited_subject"] or ""} for r in runs])
+
+
+def export_csv(runs) -> bytes:
+    df = pd.DataFrame([{
+        "prospect_name": r["prospect_name"], "company_name": r["company_name"], "prospect_role": r["prospect_role"],
+        "company_website": r["company_website"] or "", "outcome": r["outcome"] or r["status"],
+        "reason": r["outcome_reason"] or (r["error"] or ""), "review_status": r["review_status"],
+        "subject": r["edited_subject"] or "", "body": r["edited_body"] or "", "run_id": r["id"]} for r in runs])
+    return df.to_csv(index=False).encode()
+
+
+def parse_prospects(text: str) -> tuple[list[ProspectInput], list[str]]:
+    """Accepts CSV with or without a header: name, company, role[, website]."""
+    import csv
+    rows, errors = [], []
+    lines = [l for l in text.strip().splitlines() if l.strip()]
+    if not lines:
+        return [], ["No rows found."]
+    reader = list(csv.reader(lines))
+    head = [h.strip().lower() for h in reader[0]]
+    if any(h in ("name", "prospect", "prospect_name", "company", "company_name") for h in head):
+        idx = {k: next((i for i, h in enumerate(head) if any(a == h for a in al)), None) for k, al in {
+            "name": ("name", "prospect", "prospect_name", "full name"), "company": ("company", "company_name", "account"),
+            "role": ("role", "title", "prospect_role", "job title"), "site": ("website", "company_website", "domain", "url")}.items()}
+        body = reader[1:]
+    else:
+        idx, body = {"name": 0, "company": 1, "role": 2, "site": 3}, reader
+    for n, r in enumerate(body, 1):
+        get = lambda k: (r[idx[k]].strip() if idx.get(k) is not None and idx[k] < len(r) else "")
+        name, company, role = get("name"), get("company"), get("role")
+        if not (name and company and role):
+            errors.append(f"Row {n}: needs name, company and role – skipped ({', '.join(r)[:60]}).")
+            continue
+        site = get("site")
+        rows.append(ProspectInput(name, company, role, (site if site.startswith("http") else f"https://{site}") if site else None))
+    return rows, errors
+
+
+def run_batch(inputs: list[ProspectInput], batch_name: str):
+    bid = store.create_batch(batch_name)
+    prog = st.progress(0.0, text=f"0 / {len(inputs)} done")
+    table = st.empty()
+    rows = [{"#": i + 1, "prospect": p.prospect_name, "company": p.company_name, "status": "queued", "outcome": ""}
+            for i, p in enumerate(inputs)]
+    table.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    for i, p in enumerate(inputs):
+        rows[i]["status"] = "running…"
+        table.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+        def on_event(no, name, status, summary, output, i=i):
+            if status == "RUNNING":
+                rows[i]["status"] = f"stage {no}/8 · {name}"
+                table.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+        p.batch_id = bid
+        try:
+            rid = make_pipeline(on_event).run(p)
+            r = store.get_run(rid)
+            rows[i]["status"] = r["status"].lower()
+            rows[i]["outcome"] = OUTCOMES.get(r["outcome"] or "", r["outcome"] or (r["error"] or "")[:50])
+        except Exception as e:  # one bad row never stops the batch
+            rows[i]["status"], rows[i]["outcome"] = "error", str(e)[:60]
+        prog.progress((i + 1) / len(inputs), text=f"{i + 1} / {len(inputs)} done")
+        table.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    return bid
+
+
+def outcome_tiles(runs):
+    n_draft = sum(1 for r in runs if r["draft_body"])
+    n_abst = sum(1 for r in runs if (r["outcome"] or "").startswith(("ABSTAIN", "NEEDS")))
+    n_fail = sum(1 for r in runs if r["status"] == "FAILED")
+    n_appr = sum(1 for r in runs if r["review_status"] == "APPROVED")
+    st.markdown(f'''<div class="tiles">
+      <div class="tile dark"><div class="lbl">Runs</div><div class="num">{len(runs)}</div></div>
+      <div class="tile lime"><div class="lbl">Drafts for review</div><div class="num">{n_draft}</div></div>
+      <div class="tile pink"><div class="lbl">Abstained / needs input</div><div class="num">{n_abst}</div></div>
+      <div class="tile"><div class="lbl">Approved · failed</div><div class="num">{n_appr} · {n_fail}</div></div>
+    </div>''', unsafe_allow_html=True)
+
+
+def header(title, sub):
+    st.markdown(f'<div class="hello">{title}</div><div class="sub">{date.today():%A, %B %d, %Y} · {sub}</div>',
+                unsafe_allow_html=True)
+
+
 # ------------------------------------------------------------------ new run
 if view == "New run":
-    st.markdown(f'<div class="hello">New prospect run</div><div class="sub">{date.today():%A, %B %d, %Y} · '
-                'Researches live public sources, applies explicit evidence rules, then drafts for review or abstains with a reason.</div>',
-                unsafe_allow_html=True)
+    header("New prospect run", "Researches live public sources, applies explicit evidence rules, then drafts for "
+                               "review or abstains with a reason.")
+    pending = st.session_state.pop("pending", None)
     with st.form("prospect"):
         c1, c2 = st.columns(2)
         pn = c1.text_input("Prospect name *", placeholder="e.g. Jane Doe")
         role = c2.text_input("Prospect role *", placeholder="e.g. CFO, Controller, AP Manager")
         cn = c1.text_input("Company name *", placeholder="e.g. Acme Logistics")
         site = c2.text_input("Company website (optional, resolves ambiguity)", placeholder="https://")
+        conf = st.checkbox("I've already confirmed this is the right person (e.g. checked their LinkedIn)",
+                           help="Lets the run continue if public sources can't place the person. The email still "
+                                "makes no personal claims.")
         go = st.form_submit_button("Run research", type="primary", disabled=bool(missing))
 
-    if go:
+    if pending:
+        st.info(f"Re-running **{pending['prospect_name']} @ {pending['company_name']}** with your answer "
+                f"({'website ' + pending['company_website'] if pending.get('company_website') else 'identity confirmed by rep'}).")
+        rid = run_with_live_view(ProspectInput(**pending))
+        if rid:
+            st.session_state["last_run"] = rid
+    elif go:
         if not (pn.strip() and cn.strip() and role.strip()):
             st.error("Prospect name, company name and role are required.")
         else:
-            st.markdown('<div class="sec">Live execution</div>', unsafe_allow_html=True)
-            slots = {no: st.empty() for no, _ in STAGES}
-            started = {}
-            for no, name in STAGES:
-                slots[no].markdown(stage_row(no, name, "PENDING", "Waiting"), unsafe_allow_html=True)
-
-            def on_event(no, name, status, summary, output):
-                if status == "RUNNING":
-                    started[no] = time.time()
-                    slots[no].markdown(stage_row(no, name, "RUNNING", "Running…"), unsafe_allow_html=True)
-                else:
-                    el = time.time() - started.get(no, time.time())
-                    slots[no].markdown(stage_row(no, name, status, summary, el), unsafe_allow_html=True)
-
-            try:
-                pipe = Pipeline(store, build_search_client(settings), build_llm(settings),
-                                max_sources=settings.max_sources_for_extraction, on_event=on_event)
-                rid = pipe.run(ProspectInput(pn.strip(), cn.strip(), role.strip(), site.strip() or None))
+            rid = run_with_live_view(ProspectInput(pn.strip(), cn.strip(), role.strip(), site.strip() or None,
+                                                   rep_confirmed=conf))
+            if rid:
                 st.session_state["last_run"] = rid
-            except Exception as e:
-                st.error(f"Could not start run: {e}")
     if st.session_state.get("last_run"):
         st.divider()
         render_run(st.session_state["last_run"])
 
+# ------------------------------------------------------------------ batch
+elif view == "Batch":
+    header("Batch research", "An SDR's real job: a list of prospects. Each row runs the full 8-stage process; "
+                             "drafts land in the review queue, abstentions explain themselves.")
+    st.markdown('<div class="card"><h4>Input</h4>Paste CSV rows <code>name, company, role, website(optional)</code> '
+                '(a header row is fine), or upload a CSV exported from your CRM/spreadsheet. Runs are sequential '
+                '(~1 min each) to stay inside free API limits; repeated searches are served from a 24h cache.</div>',
+                unsafe_allow_html=True)
+    example = ("name,company,role,website\nMark Fleming,Beca,CFO,beca.com\nSam Lee,Apex Solutions,Controller,\n"
+               "Varun Garg,Revspot,Co-founder,")
+    up = st.file_uploader("CSV file", type=["csv"], label_visibility="collapsed")
+    if up is not None and st.session_state.get("_uploaded") != up.file_id:
+        st.session_state["batch_text"] = up.getvalue().decode("utf-8", "replace")
+        st.session_state["_uploaded"] = up.file_id
+    st.button("Fill example rows", on_click=lambda: st.session_state.update(batch_text=example))
+    txt = st.text_area("Prospects", key="batch_text", height=150, placeholder=example)
+    inputs, errs = parse_prospects(txt) if txt.strip() else ([], [])
+    for e in errs:
+        st.warning(e)
+    c1, c2 = st.columns([1, 3])
+    max_rows = 25
+    c2.caption(f"{len(inputs)} valid row(s)" + (f" – only the first {max_rows} will run" if len(inputs) > max_rows else ""))
+    if c1.button("Run batch", type="primary", disabled=not inputs or bool(missing)):
+        bid = run_batch(inputs[:max_rows], f"Batch {datetime.now():%d %b %H:%M}")
+        st.session_state["last_batch"] = bid
+    batches = store.list_batches()
+    if batches:
+        st.markdown('<div class="sec">Batches</div>', unsafe_allow_html=True)
+        labels = {b["id"]: f'{b["name"]} · {len(b["run_ids"])} run(s)' for b in batches}
+        default = list(labels).index(st.session_state["last_batch"]) if st.session_state.get("last_batch") in labels else 0
+        bsel = st.selectbox("Batch", list(labels), index=default, format_func=lambda k: labels[k])
+        bruns = [r for r in (store.get_run(i) for i in next(b for b in batches if b["id"] == bsel)["run_ids"]) if r]
+        if bruns:
+            outcome_tiles(bruns)
+            st.dataframe(runs_table(bruns), hide_index=True, width="stretch")
+            st.download_button("Download results (CSV)", export_csv(bruns), file_name=f"apex_signal_{bsel}.csv",
+                               mime="text/csv")
+            pick = st.selectbox("Open a run from this batch", [r["id"] for r in bruns],
+                                format_func=lambda k: next(f'{r["prospect_name"]} @ {r["company_name"]}' for r in bruns if r["id"] == k))
+            st.divider()
+            render_run(pick)
+
+# ------------------------------------------------------------------ evaluation
+elif view == "Evaluation":
+    header("Evaluation", "Does the judgement hold up? A labelled set of real prospects, each with the outcome the "
+                         "policy should reach. Every evaluation run is live research.")
+    st.dataframe(pd.DataFrame([{"case": c["id"], "prospect": c["prospect_name"], "company": c["company_name"],
+                                "role": c["prospect_role"], "website": c["company_website"] or "—",
+                                "expected": " or ".join(sorted(SHORT.get(o, o) for o in c["expect"])),
+                                "what it tests": c["tests"]} for c in EVAL_CASES]), hide_index=True, width="stretch")
+    if st.button(f"Run evaluation ({len(EVAL_CASES)} live runs, ~{len(EVAL_CASES)} min)", type="primary", disabled=bool(missing)):
+        bid = run_batch([ProspectInput(c["prospect_name"], c["company_name"], c["prospect_role"], c["company_website"] or None)
+                         for c in EVAL_CASES], f"Evaluation {datetime.now():%d %b %H:%M}")
+        st.session_state["last_eval"] = bid
+    evals = [b for b in store.list_batches() if b["name"].startswith("Evaluation")]
+    if evals:
+        b = next((x for x in evals if x["id"] == st.session_state.get("last_eval")), evals[0])
+        runs = [store.get_run(i) for i in b["run_ids"]]
+        rows, passed = [], 0
+        for c, r in zip(EVAL_CASES, runs):
+            if not r:
+                continue
+            got = r["outcome"] or r["status"]
+            ok = got in c["expect"]
+            passed += ok
+            s7 = next((x["output"] for x in store.get_stages(r["id"]) if x["stage_no"] == 7 and x["output"]), {}) or {}
+            rows.append({"case": c["id"], "result": "✅ pass" if ok else "❌ fail",
+                         "expected": " or ".join(sorted(SHORT.get(o, o) for o in c["expect"])),
+                         "actual": SHORT.get(got, got), "draft validated": {True: "yes", False: "issues flagged"}.get(s7.get("passed"), "—"),
+                         "seconds": round(duration_s(r) or 0), "run": r["id"]})
+        n = len(rows)
+        drafts = [x for x in rows if x["draft validated"] != "—"]
+        st.markdown(f'''<div class="tiles">
+          <div class="tile dark"><div class="lbl">Outcome accuracy</div><div class="num">{passed}/{n}</div></div>
+          <div class="tile lime"><div class="lbl">Drafts passing validation</div><div class="num">{sum(x["draft validated"] == "yes" for x in drafts)}/{len(drafts)}</div></div>
+          <div class="tile pink"><div class="lbl">Correct abstentions</div><div class="num">{sum(1 for c, x in zip(EVAL_CASES, rows) if x["result"].startswith("✅") and not (c["expect"] & {"DRAFT_READY", "DRAFT_WITH_CAVEATS"}))}</div></div>
+          <div class="tile"><div class="lbl">Median seconds / run</div><div class="num">{int(pd.Series([x["seconds"] for x in rows]).median()) if rows else 0}</div></div>
+        </div>''', unsafe_allow_html=True)
+        st.caption(f'{b["name"]} · live results change as the web changes; failures are shown, not hidden.')
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if rows:
+            pick = st.selectbox("Open an evaluation run", [x["run"] for x in rows],
+                                format_func=lambda k: next(f'{x["case"]} – {x["actual"]}' for x in rows if x["run"] == k))
+            st.divider()
+            render_run(pick)
+
 # ------------------------------------------------------------------ history
 else:
-    st.markdown(f'<div class="hello">Run history</div><div class="sub">{date.today():%A, %B %d, %Y} · every run, its stages, decision and review state</div>',
-                unsafe_allow_html=True)
+    header("Run history", "every run, its stages, decision and review state")
     runs = store.list_runs()
     if not runs:
         st.info("No runs yet.")
     else:
-        n_draft = sum(1 for r in runs if r["draft_body"])
-        n_abst = sum(1 for r in runs if (r["outcome"] or "").startswith(("ABSTAIN", "NEEDS")))
-        n_appr = sum(1 for r in runs if r["review_status"] == "APPROVED")
-        st.markdown(f'''<div class="tiles">
-          <div class="tile dark"><div class="lbl">Total runs</div><div class="num">{len(runs)}</div></div>
-          <div class="tile lime"><div class="lbl">Drafts produced</div><div class="num">{n_draft}</div></div>
-          <div class="tile pink"><div class="lbl">Abstained / needs input</div><div class="num">{n_abst}</div></div>
-          <div class="tile"><div class="lbl">Approved for manual send</div><div class="num">{n_appr}</div></div>
-        </div>''', unsafe_allow_html=True)
+        outcome_tiles(runs)
         cards = []
         for r in runs[:3]:
             stg = store.get_stages(r["id"])
@@ -383,12 +619,8 @@ else:
         st.markdown('<div class="sec">Recent runs</div><div class="rcards">' + "".join(cards) + "</div>",
                     unsafe_allow_html=True)
         st.markdown('<div class="sec">All runs</div>', unsafe_allow_html=True)
-        df = pd.DataFrame([{
-            "run": r["id"], "created (UTC)": r["created_at"].replace("T", " ")[:16], "prospect": r["prospect_name"],
-            "company": r["company_name"], "role": r["prospect_role"], "status": r["status"],
-            "outcome": OUTCOMES.get(r["outcome"] or "", r["outcome"] or (r["error"] or "")[:60]),
-            "review": r["review_status"], "subject": r["edited_subject"] or ""} for r in runs])
-        st.dataframe(df, hide_index=True, width="stretch")
+        st.dataframe(runs_table(runs), hide_index=True, width="stretch")
+        st.download_button("Download all runs (CSV)", export_csv(runs), file_name="apex_signal_runs.csv", mime="text/csv")
         labels = {r["id"]: f'{r["created_at"][:16].replace("T", " ")} · {r["prospect_name"]} @ {r["company_name"]}' for r in runs}
         sel = st.selectbox("Open run", list(labels), format_func=lambda k: labels[k])
         if sel:

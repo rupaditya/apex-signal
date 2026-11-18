@@ -180,3 +180,24 @@ def build_search_client(settings):
         elif name == "duckduckgo":
             providers.append(DuckDuckGoSearch())
     return FallbackSearch(providers)
+
+
+class CachedSearch:
+    """Wraps any search client with a 24h SQLite cache. Reruns (demo rehearsals, batch retries) cost no
+    search credits and return instantly; cached results are flagged so the UI can say so."""
+
+    def __init__(self, inner, store, max_age_hours: float = 24):
+        self.inner, self.store, self.max_age = inner, store, max_age_hours
+        self.name = getattr(inner, "name", "search")
+        self.hits = 0
+
+    def search(self, query, max_results=5, news=False, include_domains=None):
+        key = f"{query}|{max_results}|{int(news)}|{','.join(include_domains or [])}"
+        hit = self.store.cache_get("search", key, self.max_age)
+        if hit is not None:
+            self.hits += 1
+            return [SearchResult(**{k: v for k, v in h.items() if k != "domain"}) for h in hit]
+        res = self.inner.search(query, max_results=max_results, news=news, include_domains=include_domains)
+        if res:  # never cache empty results: a transient miss shouldn't stick for a day
+            self.store.cache_put("search", key, [r.to_dict() for r in res])
+        return res
