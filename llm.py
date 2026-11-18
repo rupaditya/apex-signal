@@ -126,9 +126,17 @@ class OpenAICompatLLM(BaseLLM):
             kwargs["response_format"] = {"type": "json_object"}
         if self.name != "gemini":  # Google recommends default temperature for Gemini 3
             kwargs["temperature"] = 0
+        if "gpt-oss" in kwargs["model"] and not getattr(self, "_no_reasoning_param", False):
+            # reasoning models think before answering; the rules do the judging, so low effort is enough
+            # and cuts latency several-fold on the free tier
+            kwargs["extra_body"] = {"reasoning_effort": "low"}
         try:
             return self.client.chat.completions.create(**kwargs)
         except Exception as e:
+            if "extra_body" in kwargs and "reasoning" in str(e).lower() and "400" in str(e):
+                self._no_reasoning_param = True  # provider rejected the knob: drop it and retry once
+                kwargs.pop("extra_body")
+                return self.client.chat.completions.create(**kwargs)
             # some free models reject JSON mode; the prompt already demands JSON and we validate it
             if "response_format" in kwargs and ("response_format" in str(e) or "json" in str(e).lower()) and "400" in str(e):
                 self._no_json_mode = True
