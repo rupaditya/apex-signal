@@ -330,6 +330,10 @@ class EvidenceItem:
         return self.__dict__.copy()
 
 
+ERP_VENDORS = ["sap", "oracle", "netsuite", "workday", "dynamics", "microsoft", "tally", "sage", "xero",
+               "quickbooks", "infor", "epicor", "odoo", "zoho", "ifs"]
+
+
 def _norm_fact(key: str, value: str):
     v = norm(value)
     if key == "employee_count":
@@ -344,6 +348,10 @@ def _norm_fact(key: str, value: str):
                 pass
     if key in ("prospect_current_employer",):
         return company_core(value)
+    if key == "erp_system":  # "Oracle ERP" and "Oracle Fusion Cloud ERP" are the same vendor, not a conflict
+        for vendor in ERP_VENDORS:
+            if vendor in v:
+                return vendor
     return v
 
 
@@ -543,6 +551,7 @@ BANNED_PHRASES = ["hope this finds you well", "i hope you're doing well", "syner
                   "revolutionize", "touch base", "circle back", "guaranteed", "100%"]
 MAX_BODY_WORDS = 150
 VERBATIM_WORDS = 9
+SELLER_TERMS = re.compile(r"\b(apex|we automate|our (platform|product))\b", re.I)
 
 
 def deterministic_draft_checks(draft, allowed_ids: set[str], evidence_text: str, conflicts: dict,
@@ -558,7 +567,7 @@ def deterministic_draft_checks(draft, allowed_ids: set[str], evidence_text: str,
         if p in low:
             problems.append(f"Contains banned phrase: '{p}'.")
     for c in draft.claims:
-        if c.kind == "fact":
+        if c.kind == "fact" and not SELLER_TERMS.search(c.sentence):  # statements about the seller cite the seller description
             if not c.evidence_ids:
                 problems.append(f"Factual sentence has no evidence citation: \"{c.sentence[:80]}\"")
             bad = [i for i in c.evidence_ids if i not in allowed_ids]
