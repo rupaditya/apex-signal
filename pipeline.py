@@ -372,10 +372,28 @@ class Pipeline:
 
         # ---------------- Stage 7: validate (+ one repair)
         self._start(run_id, 7)
-        attempts = []
-        for attempt in range(2):
+        attempts, repairs, llm_checks = [], 0, 0
+
+        def repair(problems):
+            return self.llm.call_json(
+                "repair", "You fix B2B emails so every factual statement is supported by evidence.",
+                draft_prompt + "\n\nYOUR PREVIOUS DRAFT FAILED THESE CHECKS – fix all of them:\n- "
+                + "\n- ".join(problems) + f"\n\nPrevious draft:\n{draft.body}", EmailDraft)
+
+        while True:
+            # cheap, deterministic checks first: if they fail, repair before spending an LLM fact-check
             problems = policy.deterministic_draft_checks(draft, allowed_ids, allowed_text, conflicts, source_text=source_only)
+            if problems and repairs < 2:
+                attempts.append({"draft": draft.model_dump(), "problems": problems, "verdict": None, "check": "rules"})
+                try:
+                    draft, repairs = repair(problems), repairs + 1
+                    continue
+                except LLMError as e:
+                    problems.append(f"Repair failed: {e}")
+                    attempts[-1]["problems"] = problems
+                    break
             try:
+                llm_checks += 1
                 verdict = self.llm.call_json(
                     "validate",
                     "You are a strict fact-checker. Judge each sentence ONLY against the evidence provided.",
@@ -385,27 +403,23 @@ class Pipeline:
                     "hedged), neutral (greeting, sign-off, ask, seller description), unsupported (asserts something "
                     "about the prospect/company not in evidence).",
                     ValidationVerdict)
-                unsupported = [s for s in verdict.sentences if s.verdict == "unsupported"]
+                unsupported = [x for x in verdict.sentences if x.verdict == "unsupported"]
             except LLMError as e:
                 verdict, unsupported = None, []
                 problems.append(f"LLM fact-check unavailable: {e}")
-            for s in unsupported:
-                problems.append(f"Unsupported: \"{s.sentence[:100]}\" – {s.reason}")
+            problems += [f"Unsupported: \"{x.sentence[:100]}\" – {x.reason}" for x in unsupported]
             attempts.append({"draft": draft.model_dump(), "problems": problems,
-                             "verdict": verdict.model_dump() if verdict else None})
-            if not problems or attempt == 1:
-                break
-            try:  # one repair pass
-                draft = self.llm.call_json(
-                    "repair", "You fix B2B emails so every factual statement is supported by evidence.",
-                    draft_prompt + "\n\nYOUR PREVIOUS DRAFT FAILED THESE CHECKS – fix all of them:\n- "
-                    + "\n- ".join(problems) + f"\n\nPrevious draft:\n{draft.body}", EmailDraft)
-            except LLMError as e:
-                problems.append(f"Repair failed: {e}")
-                break
+                             "verdict": verdict.model_dump() if verdict else None, "check": "rules + LLM fact-check"})
+            if unsupported and repairs < 2 and llm_checks < 2:
+                try:
+                    draft, repairs = repair(problems), repairs + 1
+                    continue
+                except LLMError as e:
+                    attempts[-1]["problems"].append(f"Repair failed: {e}")
+            break
         passed = not attempts[-1]["problems"]
         self._finish(run_id, 7, "DONE" if passed else "WARNING",
-                     "Passed" + (" after 1 repair" if len(attempts) > 1 else "") if passed
+                     "Passed" + (f" after {repairs} repair(s)" if repairs else "") if passed
                      else f"{len(attempts[-1]['problems'])} issue(s) remain – flagged for reviewer",
                      {"attempts": attempts, "passed": passed})
 
