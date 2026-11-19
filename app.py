@@ -154,7 +154,7 @@ def stage_row(no, name, status, summary="", elapsed=None):
 with st.sidebar:
     st.markdown('<div class="brand"><div class="logo">◆</div>Apex Signal</div>', unsafe_allow_html=True)
     st.caption("Evidence-first prospect research & outreach drafts for AP automation.")
-    view = st.radio("View", ["New run", "Batch", "Run history", "Evaluation"], label_visibility="collapsed", key="view")
+    view = st.radio("View", ["New run", "Batch", "Run history", "Evaluation", "Tutorial"], label_visibility="collapsed", key="view")
     st.divider()
     missing = settings.missing_credentials()
     search_ok = bool(settings.search_chain)
@@ -597,6 +597,138 @@ elif view == "Evaluation":
                                 format_func=lambda k: next(f'{x["case"]} – {x["actual"]}' for x in rows if x["run"] == k))
             st.divider()
             render_run(pick)
+
+# ------------------------------------------------------------------ tutorial
+elif view == "Tutorial":
+    header("Tutorial", "What Apex Signal does, how it decides, and how to use every page")
+
+    def card(title, body, cls=""):
+        st.markdown(f'<div class="card {cls}"><h4>{title}</h4>{body}</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sec">1 · The problem and the use case</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        card("The problem", "An SDR working a list of 200 prospects can't spend 20 minutes researching each one, so "
+             "they send templates – and templates get deleted. The signal that would earn a reply (a finance hire, "
+             "an ERP migration, an IPO filing) is usually public; finding it and judging whether it matters is the work.")
+    with c2:
+        card("What Apex Signal does", "Give it a prospect (or a list). It researches live public sources, decides with "
+             "<b>explicit rules</b> whether there is a credible <i>and</i> relevant reason to contact this person, and "
+             "either drafts a short email for human review or <b>abstains with a stated reason</b>. Nothing is ever "
+             "sent automatically.", "lime")
+    card("Who it's for", "Seller: <b>Apex</b> (fictional) – accounts-payable automation: invoice capture, 2/3-way PO "
+         "matching, approval routing, exception management. Buyers: CFOs, Finance Directors, Controllers and AP "
+         "leaders at mid-market companies. The goal is not polished emails – it is a <b>defensible reason to write</b>, "
+         "and the discipline to not write when there isn't one.")
+
+    st.markdown('<div class="sec">2 · How to navigate</div>', unsafe_allow_html=True)
+    nav = [
+        ("New run", "Research one prospect. Enter name, role, company and (optional) website, press <b>Run research</b> "
+         "and watch the 8 stages execute live. Tick <i>I've already confirmed this person</i> if you've checked "
+         "their LinkedIn and public sources can't place them."),
+        ("Batch", "Research a list. Paste CSV rows <code>name, company, role, website</code> or upload a CSV "
+         "(<b>Fill example rows</b> loads a demo). Rows run one after another with a live status table; download "
+         "all outcomes and drafts as CSV."),
+        ("Run history", "Every run ever made: status, outcome, review state and duration. Open any run to see its "
+         "full decision, evidence and draft. Export everything as CSV."),
+        ("Evaluation", "A labelled set of real prospects with the outcome the rules <i>should</i> reach. "
+         "<b>Run evaluation</b> researches all of them live and scores the judgement: outcome accuracy, drafts "
+         "passing validation, correct abstentions, speed."),
+        ("Tutorial", "This page."),
+    ]
+    st.markdown('<div class="card">' + "".join(f"<p><b>{n}</b> – {d}</p>" for n, d in nav) + "</div>",
+                unsafe_allow_html=True)
+    card("Reading a run", "<b>Decision</b> tab: identity check, the rule outcome, and four separated boxes – "
+         "① verified observations (with quote, source, date), ② the hypothesised business implication (pink: not "
+         "verified), ③ relevance to the product (lime), ④ unsupported assumptions and limitations – plus <b>Other "
+         "hooks considered</b> and why they ranked lower. <b>Evidence &amp; sources</b>: every extracted item with "
+         "its labels and the written reason it was excluded; every source with its query and whether the page was "
+         "read. <b>Draft &amp; review</b>: validation result, editable subject/body, <i>Save edits</i>, <i>Approve for "
+         "manual send</i>, <i>Reject</i>, and the sentence-level fact check. <b>Stage log</b>: raw output of every "
+         "stage with timestamps.")
+    card("When a run stops to ask", "If the company name matches several organisations, or the person can't be "
+         "placed at the company, the run stops after stage 1 instead of guessing. A <b>Resolve and continue</b> "
+         "panel offers one-click buttons (<i>Use example.com</i> / <i>I've confirmed this person</i>); the re-run is "
+         "linked to the original.", "pink")
+
+    st.markdown('<div class="sec">3 · What happens in a run (the 8 stages)</div>', unsafe_allow_html=True)
+    stages_txt = [
+        ("Identify", "Searches person + company; the AI lists matching organisations and mentions of the person with "
+         "verbatim quotes; <b>rules</b> decide: company PROVIDED / RESOLVED / AMBIGUOUS, prospect CONFIRMED / "
+         "ROLE_MISMATCH / NOT_FOUND / AMBIGUOUS / CONFLICTING. Ambiguity stops the run here."),
+        ("Research", "6–7 targeted searches (news, finance/AP jobs, ERP changes, finance leadership, M&amp;A/expansion, "
+         "prospect interviews, the company's own press pages), then the top pages are actually read to get full "
+         "text and publish dates. Searches are cached for 24h."),
+        ("Extract", "Only the sentences about this company/person/finance signals are kept; the AI extracts "
+         "observations (verbatim quote + neutral statement + signal type) and key facts (CFO, ERP, headcount…)."),
+        ("Evaluate", "Each observation gets labels: quote really in the source? source tier A/B/C? fresh / aging / "
+         "stale / undated? about this company? relevance DIRECT / INDIRECT / NONE? depends on a conflicting fact?"),
+        ("Select angle", "Rules pick the outcome and the strongest hook (ordered rule, not a score). The AI then "
+         "explains hook, hypothesis, product relevance and assumptions."),
+        ("Draft", "60–120 words, only from the selected evidence, each sentence tagged with its evidence ids. "
+         "Unverified prospects get no personal claims."),
+        ("Validate", "Rule checks first (citations, numbers, no copying sources, <code>[Your name]</code> sign-off, "
+         "length, banned phrases, conflicted values), then an AI sentence-level fact check; up to two automatic "
+         "repairs; anything left is flagged, never hidden."),
+        ("Review", "Saved as PENDING_REVIEW. A human edits, approves for manual send, or rejects."),
+    ]
+    st.markdown('<div class="card">' + "".join(f"<p><b>{i}. {n}</b> – {d}</p>" for i, (n, d) in enumerate(stages_txt, 1))
+                + "</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="sec">4 · Methodology: how it decides</div>', unsafe_allow_html=True)
+    card("Principle", "<b>The AI reads and writes; rules decide.</b> No confidence scores – every evidence item gets "
+         "categorical labels and every exclusion has a written reason, so any decision can be explained to a "
+         "sales manager and is covered by automated tests. A credible signal is not automatically a relevant one.", "lime")
+    st.table(pd.DataFrame([
+        {"relevance": "DIRECT – can open the email", "signals": "Finance/AP hiring in the company's own team · change "
+         "to its OWN ERP/finance system · finance transformation / shared services · publicly stated AP pain"},
+        {"relevance": "INDIRECT – only as a question, always flagged", "signals": "New CFO/controller · IPO / listing "
+         "preparation · M&A · expansion · rapid growth · the prospect's own finance commentary"},
+        {"relevance": "NONE – never a hook", "signals": "Funding · product launches / marketing · awards / PR"},
+    ]).set_index("relevance"))
+    c1, c2 = st.columns(2)
+    with c1:
+        card("Source & time rules", "Tier A: company's own site, government/SEC filings, wire services, major business "
+             "press. Tier C (never a hook, never proves identity): data brokers, scraped profiles, social/UGC. "
+             "Everything else: tier B.<br>Fresh ≤ 12 months · aging 12–24 · stale &gt; 24 (excluded) · undated "
+             "(allowed, flagged).<br>A quote must actually appear in the retrieved text, or it is treated as a "
+             "hallucination and dropped.")
+    with c2:
+        card("Rules learned from live stress tests", "• Expansion plans inside funding news count as <b>funding</b>.<br>"
+             "• INDIRECT hook + non-finance or unverified recipient = two guesses stacked → <b>abstain</b>.<br>"
+             "• An earlier, different role at the same company is career history, not a conflict.<br>"
+             "• Drafts may not copy 9+ words from a source.<br>• Sign-off must be <code>[Your name]</code>.<br>"
+             "• Facts are compared by meaning (Oracle ERP = Oracle Fusion).", "pink")
+    st.table(pd.DataFrame([{"outcome": OUTCOMES[k], "when": w} for k, w in [
+        ("NEEDS_INPUT_AMBIGUOUS_IDENTITY", "Several organisations match, or the person can't be placed / sources disagree on their employment."),
+        ("ABSTAIN_CONFLICTING_EVIDENCE", "Relevant signals depend on facts credible sources disagree on, or exist only on unreliable sources."),
+        ("ABSTAIN_LOW_RELEVANCE", "Credible news exists but none links to AP – or an indirect hook to a non-buyer."),
+        ("ABSTAIN_NO_CREDIBLE_EVIDENCE", "Nothing credible, current and about this company was found."),
+        ("DRAFT_WITH_CAVEATS", "A usable hook, but something the reviewer must check (indirect link, undated source, unverified prospect…)."),
+        ("DRAFT_READY", "A DIRECT, credible, current hook about a verified finance buyer.")]]).set_index("outcome"))
+
+    st.markdown('<div class="sec">5 · Try it</div>', unsafe_allow_html=True)
+    st.table(pd.DataFrame([
+        {"try": "Happy path", "name": "Mark Fleming", "role": "CFO", "company": "Beca", "website": "https://www.beca.com",
+         "what you'll see": "A verified CFO and a fresh finance-systems / AP signal → validated draft"},
+        {"try": "Ambiguous identity", "name": "Sam Lee", "role": "Controller", "company": "Apex Solutions", "website": "",
+         "what you'll see": "Stops at stage 1, lists the matching companies, one-click resolve"},
+        {"try": "Credible but irrelevant", "name": "Varun Garg", "role": "Co-founder", "company": "Revspot", "website": "",
+         "what you'll see": "Abstains: funding/product news, founder isn't an AP buyer"},
+        {"try": "Nothing to find", "name": "Rohan Vexler", "role": "CFO", "company": "Quillmarsh Ledgerworks", "website": "",
+         "what you'll see": "No credible evidence → no draft"},
+    ]).set_index("try"))
+
+    st.markdown('<div class="sec">6 · Stack, cost and limits</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        card("Built on free tiers (₹0)", "Search: Tavily → Serper → DuckDuckGo. AI: Groq (gpt-oss) → Gemini, with "
+             "automatic fallback to another free model or provider on rate limits. Python · Streamlit · SQLite. "
+             "Every run, stage output and review action is persisted.")
+    with c2:
+        card("Known limits", "Can't read LinkedIn or paywalled/JS-only pages · ~40–90 s per run on free tiers · "
+             "public web results change daily · history resets when the hosted app restarts · no CRM sync or "
+             "sending by design.")
 
 # ------------------------------------------------------------------ history
 else:
